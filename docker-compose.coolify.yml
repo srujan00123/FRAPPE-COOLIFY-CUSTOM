@@ -1,0 +1,276 @@
+services:
+  configure:
+    image: "${FRAPPE_IMAGE}:${FRAPPE_VERSION:-develop}"
+    restart: "no"
+    entrypoint:
+      - bash
+      - -c
+    command:
+      - >-
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host db;
+        bench set-config -gp db_port 3306;
+        bench set-config -g redis_cache "redis://redis-cache:6379";
+        bench set-config -g redis_queue "redis://redis-queue:6379";
+        bench set-config -g redis_socketio "redis://redis-queue:6379";
+        bench set-config -gp socketio_port 9000;
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+
+  create-site:
+    image: "${FRAPPE_IMAGE}:${FRAPPE_VERSION:-develop}"
+    restart: "no"
+    entrypoint:
+      - bash
+      - -c
+    command:
+      - |-
+        wait-for-it -t 120 db:3306;
+        wait-for-it -t 120 redis-cache:6379;
+        wait-for-it -t 120 redis-queue:6379;
+        SITES_JSON="/home/frappe/frappe-bench/sites.json"
+        if [ -n "$$SITES_JSON_BASE64" ]; then
+          echo "$$SITES_JSON_BASE64" | base64 -d > "$$SITES_JSON"
+          echo "Decoded sites config from SITES_JSON_BASE64"
+        elif [ ! -f "$$SITES_JSON" ]; then
+          echo "Error: No SITES_JSON_BASE64 env var and no baked-in sites.json"
+          exit 1
+        else
+          echo "Using baked-in sites.json"
+        fi
+        SITE_COUNT=$$(jq length "$$SITES_JSON")
+        for i in $$(seq 0 $$((SITE_COUNT - 1))); do
+          SITE_NAME=$$(jq -r ".[$$i].name" "$$SITES_JSON")
+          IS_DEFAULT=$$(jq -r ".[$$i].default // false" "$$SITES_JSON")
+          if [ ! -d "sites/$$SITE_NAME" ]; then
+            INSTALL_APPS=$$(jq -r ".[$$i].apps[]" "$$SITES_JSON" | sed 's/^/--install-app /' | tr '\n' ' ')
+            SITE_NUM=$$((i + 1))
+            SITE_PWD_VAR="ADMIN_PASSWORD_$${SITE_NUM}"
+            SITE_PWD=$$(eval echo "\$$$$SITE_PWD_VAR")
+            SITE_PWD=$${SITE_PWD:-$$ADMIN_PASSWORD}
+            echo "Creating site $$SITE_NAME..."
+            bench new-site "$$SITE_NAME" \
+              --mariadb-root-password "$$DB_ROOT_PASSWORD" \
+              --db-root-username root \
+              --admin-password "$$SITE_PWD" \
+              --mariadb-user-host-login-scope "%" \
+              $$INSTALL_APPS
+          else
+            echo "Site $$SITE_NAME already exists. Skipping."
+          fi
+          if [ "$$IS_DEFAULT" = "true" ]; then
+            bench use "$$SITE_NAME"
+          fi
+        done
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    environment:
+      SITES_JSON_BASE64: "${SITES_JSON_BASE64}"
+      ADMIN_PASSWORD: "${SERVICE_PASSWORD_ADMIN}"
+      ADMIN_PASSWORD_1: "${ADMIN_PASSWORD_1:-}"
+      ADMIN_PASSWORD_2: "${ADMIN_PASSWORD_2:-}"
+      DB_ROOT_PASSWORD: "${SERVICE_PASSWORD_DB}"
+    depends_on:
+      configure:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+
+  migrate:
+    image: "${FRAPPE_IMAGE}:${FRAPPE_VERSION:-develop}"
+    restart: "no"
+    entrypoint:
+      - bash
+      - -c
+    command:
+      - >-
+        if [ "${SKIP_MIGRATE:-false}" = "true" ]; then
+          echo "Skipping migration (SKIP_MIGRATE=true)";
+        else
+          bench --site all migrate;
+        fi
+    environment:
+      SKIP_MIGRATE: "${SKIP_MIGRATE:-false}"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      create-site:
+        condition: service_completed_successfully
+
+  backend:
+    image: "${FRAPPE_IMAGE}:${FRAPPE_VERSION:-develop}"
+    restart: unless-stopped
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -so /dev/null http://localhost:8000/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+
+  frontend:
+    image: "${FRAPPE_IMAGE}:${FRAPPE_VERSION:-develop}"
+    restart: unless-stopped
+    command:
+      - nginx-entrypoint.sh
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      UPSTREAM_REAL_IP_ADDRESS: ${UPSTREAM_REAL_IP_ADDRESS:-127.0.0.1}
+      UPSTREAM_REAL_IP_HEADER: ${UPSTREAM_REAL_IP_HEADER:-X-Forwarded-For}
+      UPSTREAM_REAL_IP_RECURSIVE: ${UPSTREAM_REAL_IP_RECURSIVE:-off}
+      PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
+      CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -so /dev/null http://localhost:8080/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      - traefik.http.services.frontend.loadbalancer.server.port=8080
+      # Redirect helpdesk.example.com/ → /helpdesk/my-tickets (customer portal)
+      - traefik.http.middlewares.helpdesk-redirect.redirectregex.regex=^https://helpdesk\.example\.com/?$$
+      - traefik.http.middlewares.helpdesk-redirect.redirectregex.replacement=https://helpdesk.example.com/helpdesk/my-tickets
+      - traefik.http.middlewares.helpdesk-redirect.redirectregex.permanent=true
+      # Redirect crm.example.com/ → /crm
+      - traefik.http.middlewares.crm-redirect.redirectregex.regex=^https://crm\.example\.com/?$$
+      - traefik.http.middlewares.crm-redirect.redirectregex.replacement=https://crm.example.com/crm
+      - traefik.http.middlewares.crm-redirect.redirectregex.permanent=true
+    depends_on:
+      backend:
+        condition: service_healthy
+      websocket:
+        condition: service_started
+
+  websocket:
+    image: "${FRAPPE_IMAGE}:${FRAPPE_VERSION:-develop}"
+    restart: unless-stopped
+    command:
+      - node
+      - /home/frappe/frappe-bench/apps/frappe/socketio.js
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  queue-long:
+    image: "${FRAPPE_IMAGE}:${FRAPPE_VERSION:-develop}"
+    restart: unless-stopped
+    command:
+      - bench
+      - worker
+      - --queue
+      - long,default,short
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  queue-short:
+    image: "${FRAPPE_IMAGE}:${FRAPPE_VERSION:-develop}"
+    restart: unless-stopped
+    command:
+      - bench
+      - worker
+      - --queue
+      - short,default
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  scheduler:
+    image: "${FRAPPE_IMAGE}:${FRAPPE_VERSION:-develop}"
+    restart: unless-stopped
+    command:
+      - bench
+      - schedule
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  db:
+    image: mariadb:11.8
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed
+    environment:
+      MYSQL_ROOT_PASSWORD: "${SERVICE_PASSWORD_DB}"
+      MARIADB_ROOT_PASSWORD: "${SERVICE_PASSWORD_DB}"
+      MARIADB_AUTO_UPGRADE: "1"
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test:
+        - CMD
+        - healthcheck.sh
+        - --connect
+        - --innodb_initialized
+      start_period: 5s
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis-cache:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 5s
+      retries: 5
+
+  redis-queue:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-queue-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 5s
+      retries: 5
+
+volumes:
+  db-data:
+  redis-queue-data:
+  sites:
+  logs:

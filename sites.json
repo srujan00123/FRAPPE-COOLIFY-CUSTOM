@@ -1,0 +1,12 @@
+[
+  {
+    "name": "erp.example.com",
+    "apps": ["erpnext", "hrms", "crm", "helpdesk", "telephony", "frappe_whatsapp", "mint", "india_compliance"],
+    "default": true
+  },
+  {
+    "name": "erp.example2.com",
+    "apps": ["erpnext", "hrms", "crm", "helpdesk", "telephony", "frappe_whatsapp", "mint", "india_compliance"],
+    "default": false
+  }
+]
