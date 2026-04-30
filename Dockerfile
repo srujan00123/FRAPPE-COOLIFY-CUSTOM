@@ -4,18 +4,26 @@ FROM frappe/build:${FRAPPE_BRANCH} AS builder
 
 ARG FRAPPE_BRANCH=develop
 ARG FRAPPE_PATH=https://github.com/frappe/frappe
-ARG APPS_JSON_BASE64
-
-USER root
-
-RUN if [ -n "${APPS_JSON_BASE64}" ]; then \
-    mkdir /opt/frappe && echo "${APPS_JSON_BASE64}" | base64 -d > /opt/frappe/apps.json; \
-  fi
 
 USER frappe
 
-RUN export APP_INSTALL_ARGS="" && \
-  if [ -n "${APPS_JSON_BASE64}" ]; then \
+ENV NODE_OPTIONS="--max-old-space-size=2048"
+
+# apps.json is mounted as a BuildKit secret (not a build-arg), so it never
+# enters the image's build cache key in plaintext and can contain repo URLs.
+# github_token is optional; mount it when apps.json contains private repos.
+RUN --mount=type=secret,id=apps_json,target=/opt/frappe/apps.json,uid=1000,gid=1000 \
+    --mount=type=secret,id=github_token,uid=1000,gid=1000,required=false \
+    --mount=type=cache,target=/home/frappe/.cache,uid=1000,gid=1000,sharing=locked \
+    --mount=type=cache,target=/home/frappe/.npm,uid=1000,gid=1000,sharing=locked \
+    --mount=type=cache,target=/home/frappe/.yarn,uid=1000,gid=1000,sharing=locked \
+  if [ -s /run/secrets/github_token ]; then \
+    TOKEN=$(cat /run/secrets/github_token) && \
+    git config --global "url.https://x-access-token:${TOKEN}@github.com/.insteadOf" "https://github.com/" && \
+    echo "Configured git to use token for github.com clones"; \
+  fi && \
+  export APP_INSTALL_ARGS="" && \
+  if [ -f /opt/frappe/apps.json ] && [ -s /opt/frappe/apps.json ]; then \
     export APP_INSTALL_ARGS="--apps_path=/opt/frappe/apps.json"; \
   fi && \
   bench init ${APP_INSTALL_ARGS}\
@@ -24,11 +32,11 @@ RUN export APP_INSTALL_ARGS="" && \
     --no-procfile \
     --no-backups \
     --skip-redis-config-generation \
-    --verbose \
     /home/frappe/frappe-bench && \
   cd /home/frappe/frappe-bench && \
-  echo "{}" > sites/common_site_config.json && \
-  find apps -mindepth 1 -path "*/.git" | xargs rm -fr
+  echo '{"socketio_port": 9000, "webserver_port": 8000, "redis_queue": "redis://redis-queue:11311", "redis_cache": "redis://redis-cache:13311"}' > sites/common_site_config.json && \
+  find apps -mindepth 1 -path "*/.git" | xargs rm -fr && \
+  rm -f /home/frappe/.gitconfig
 
 FROM frappe/base:${FRAPPE_BRANCH} AS backend
 

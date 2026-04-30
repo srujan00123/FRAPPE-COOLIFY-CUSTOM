@@ -66,26 +66,39 @@ IMAGE=ghcr.io/youruser/custom-frappe TAG=v1.0 PUSH=true ./build.sh
 
 Defaults: `IMAGE=ghcr.io/youruser/custom-frappe`, `TAG=develop`, `FRAPPE_BRANCH=develop`.
 
-Every build is also tagged with a date stamp (e.g., `develop-20260212`) for rollback.
+Every build is also tagged with a timestamp (e.g., `develop-20260212-143005`) for rollback.
 
-The script handles base64-encoding `apps.json` automatically (works on Linux, macOS, and Git Bash on Windows).
+**Optional `.env` file** — drop a `.env` next to `build.sh` and any of `IMAGE`, `TAG`, `FRAPPE_BRANCH`, `PUSH`, `GITHUB_USER`, `GITHUB_TOKEN`, `PLATFORM`, `BUILDER`, `CACHE_REF` will be picked up automatically.
+
+**Build performance** — the script uses `docker buildx` with:
+
+- BuildKit cache mounts for `~/.cache` (pip/uv), `~/.npm`, `~/.yarn` so package downloads persist across builds
+- Registry-backed layer cache pushed to `<IMAGE>:buildcache` so warm layers are shared across machines and CI
+
+First build is cold (~7–15 min); subsequent rebuilds with no app changes are typically 1–3 min.
+
+**Platform** — defaults to your host architecture. Coolify usually runs amd64; if your laptop is arm64 (Apple Silicon), let CI build the production image instead of cross-compiling locally — QEMU emulation of `uv` segfaults during `bench init`.
+
+**Private apps** — if `apps.json` contains private repos, set `GITHUB_TOKEN` in `.env` (a PAT with read access). The script forwards it as a BuildKit secret; the Dockerfile rewrites GitHub HTTPS URLs to use the token via `git config --global url.insteadOf`, then wipes `~/.gitconfig` so the token is not baked into the image.
 
 ### CI/CD (GitHub Actions)
 
 Pushing to `main` automatically builds and deploys via `.github/workflows/deploy.yml`:
 
-1. Builds the Docker image on GitHub Actions runners
-2. Pushes to `ghcr.io/youruser/custom-frappe` with tags: `latest`, `develop`, `develop-<date>`, `develop-<sha>`
-3. Triggers Coolify redeploy via webhook
+1. Builds the Docker image on GitHub Actions runners (native amd64 — no QEMU)
+2. Pushes to `ghcr.io/youruser/custom-frappe` with tags: `latest`, `develop`, `develop-<timestamp>`, `develop-<sha>`
+3. Pulls/pushes layer cache from `ghcr.io/youruser/custom-frappe:buildcache`, shared with local builds
+4. Coolify auto-redeploys on the new image (or, optionally, set `COOLIFY_WEBHOOK` to trigger explicitly)
 
 **Setup required** (one-time, in GitHub repo Settings > Secrets):
 
-| Secret | Value |
+| Secret | When to set it |
 |---|---|
-| `COOLIFY_WEBHOOK` | `https://<your-coolify>/api/v1/deploy?uuid=<resource-id>` |
-| `COOLIFY_TOKEN` | API token from Coolify > Security > API Tokens |
+| `APPS_PRIVATE_TOKEN` | **Only if `apps.json` contains private repos.** Personal Access Token with `contents:read` on those repos. Names beginning with `GITHUB_` are reserved by GitHub. |
+| `COOLIFY_WEBHOOK` (optional) | `https://<your-coolify>/api/v1/deploy?uuid=<resource-id>` if you want CI to trigger Coolify directly instead of relying on Coolify's image-watch. |
+| `COOLIFY_TOKEN` (optional) | API token from Coolify > Security > API Tokens (only with `COOLIFY_WEBHOOK`). |
 
-`GITHUB_TOKEN` is automatic — no setup needed for GHCR.
+`GITHUB_TOKEN` is automatic — no setup needed for pushing to GHCR.
 
 Then set in Coolify:
 

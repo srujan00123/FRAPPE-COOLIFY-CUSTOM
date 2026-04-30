@@ -8,6 +8,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/youruser/custom-frappe
+  CACHE_REF: ghcr.io/youruser/custom-frappe:buildcache
 
 jobs:
   build-and-deploy:
@@ -30,12 +31,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Prepare build args
+      - name: Prepare tags
         id: prep
         run: |
-          APPS_JSON_BASE64=$(base64 -w 0 apps.json)
-          echo "apps_json_base64=$APPS_JSON_BASE64" >> "$GITHUB_OUTPUT"
-          echo "date_tag=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "date_tag=$(date +%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
           echo "sha_tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push image
@@ -43,13 +42,23 @@ jobs:
         with:
           context: .
           push: true
+          platforms: linux/amd64
+          # apps.json is passed as a BuildKit secret (matches Dockerfile).
+          # APPS_PRIVATE_TOKEN: optional repo secret with read access to any
+          # private apps in apps.json. Default GITHUB_TOKEN can't read other
+          # repos. Names starting with GITHUB_ are reserved by GitHub.
+          # Skip the secret if you have no private apps; the Dockerfile
+          # gracefully no-ops when github_token is empty.
+          secret-files: |
+            apps_json=apps.json
+          secrets: |
+            github_token=${{ secrets.APPS_PRIVATE_TOKEN }}
           build-args: |
-            APPS_JSON_BASE64=${{ steps.prep.outputs.apps_json_base64 }}
             FRAPPE_BRANCH=develop
           tags: |
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:develop
             ${{ env.IMAGE_NAME }}:develop-${{ steps.prep.outputs.date_tag }}
             ${{ env.IMAGE_NAME }}:develop-${{ steps.prep.outputs.sha_tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=registry,ref=${{ env.CACHE_REF }}
+          cache-to: type=registry,ref=${{ env.CACHE_REF }},mode=max
