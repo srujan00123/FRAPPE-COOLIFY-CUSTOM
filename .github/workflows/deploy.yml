@@ -62,3 +62,28 @@ jobs:
             ${{ env.IMAGE_NAME }}:develop-${{ steps.prep.outputs.sha_tag }}
           cache-from: type=registry,ref=${{ env.CACHE_REF }}
           cache-to: type=registry,ref=${{ env.CACHE_REF }},mode=max
+
+      - name: Trigger Coolify deploy
+        env:
+          COOLIFY_WEBHOOK_URL: ${{ secrets.COOLIFY_WEBHOOK_URL }}
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+        run: |
+          if [ -z "$COOLIFY_WEBHOOK_URL" ] || [ -z "$COOLIFY_TOKEN" ]; then
+            echo "::error::COOLIFY_WEBHOOK_URL or COOLIFY_TOKEN secret is not set"
+            exit 1
+          fi
+          # Strip any whitespace or stray CR/LF that may have slipped into the secret
+          url=$(printf '%s' "$COOLIFY_WEBHOOK_URL" | tr -d '[:space:]')
+          # Sanity print: scheme + host only, never the full URL or token
+          scheme=$(printf '%s' "$url" | sed -E 's#^([a-z]+)://.*#\1#')
+          host=$(printf '%s' "$url" | sed -E 's#^[a-z]+://([^/?]+).*#\1#')
+          echo "Calling Coolify deploy webhook: scheme=$scheme host=$host url_length=${#url}"
+          response=$(curl -sS -o /tmp/coolify_response.json -w "%{http_code}" \
+            -X GET --url "$url" \
+            -H "Authorization: Bearer $COOLIFY_TOKEN")
+          echo "Coolify response (HTTP $response):"
+          cat /tmp/coolify_response.json || true
+          echo
+          if [ "$response" -lt 200 ] || [ "$response" -ge 300 ]; then
+            exit 1
+          fi
